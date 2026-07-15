@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Show per-model summary weight for the last N epochs in a single table,
-with start and end weights and each model's proportion of total.
+Show per-model weight distribution for the last N epochs.
+
+Total network weight comes from the root epoch_group_data.total_weight — the
+same value the tracker shows. Per-model split uses confirmation_weight ratios
+from each model's subgroup.
 
 Currently tracks: MiniMaxAI/MiniMax-M2.7 and moonshotai/Kimi-K2.6
 """
@@ -21,9 +24,6 @@ if not ARCHIVE_NODE or not INFERENCED_BINARY:
     print("ERROR: ARCHIVE_NODE_URL and INFERENCED_BINARY must be set in .env", file=sys.stderr)
     sys.exit(1)
 
-EPOCH_132_END_HEIGHT = 2058357
-EPOCH_LENGTH = 15391
-
 MODELS = [
     "MiniMaxAI/MiniMax-M2.7",
     "moonshotai/Kimi-K2.6",
@@ -33,10 +33,6 @@ SHORT = {
     "MiniMaxAI/MiniMax-M2.7": "Minimax",
     "moonshotai/Kimi-K2.6": "Kimi",
 }
-
-
-def epoch_start_height(epoch_id: int) -> int:
-    return EPOCH_132_END_HEIGHT + (epoch_id - 133) * EPOCH_LENGTH + 1
 
 
 def get_current_epoch() -> int:
@@ -49,38 +45,68 @@ def get_current_epoch() -> int:
     cmd = [INFERENCED_BINARY, "status", "--node", ARCHIVE_NODE, "-o", "json"]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=True)
     height = int(json.loads(result.stdout)["sync_info"]["latest_block_height"])
+    EPOCH_132_END_HEIGHT = 2058357
+    EPOCH_LENGTH = 15391
     return 132 + (height - EPOCH_132_END_HEIGHT) // EPOCH_LENGTH
 
 
-def get_model_weights(poc_start_height: int, query_height: int) -> dict[str, int]:
+def query_egdata(epoch_index: int, model_id: str | None = None) -> dict | None:
     cmd = [
         INFERENCED_BINARY, "query", "inference",
-        "all-ml-node-weight-distributions-for-stage",
-        "--poc-stage-start-block-height", str(poc_start_height),
-        "--height", str(query_height),
+        "show-epoch-group-data", str(epoch_index),
         "--node", ARCHIVE_NODE, "-o", "json",
     ]
+    if model_id:
+        cmd += ["--model-id", model_id]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if result.returncode != 0:
-        return {}
+        return None
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError:
-        return {}
-    by_model: dict[str, int] = {}
-    for dist in data.get("distributions", []):
-        mid = dist["model_id"]
-        total = sum(w["weight"] for w in dist.get("weights", []))
-        by_model[mid] = by_model.get(mid, 0) + total
-    return by_model
+        return None
+    return data.get("epoch_group_data") or data.get("EpochGroupData") or data
 
 
-def fmt_w(w: int) -> str:
-    return f"{w:,}" if w else "-"
+def get_epoch_data(epoch_index: int) -> dict | None:
+    """
+    Returns {model_id: allocated_weight} where allocated_weight is each model's
+    share of root total_weight, split by confirmation_weight ratios from subgroups.
+    Also returns '_total' key with the root total_weight.
+    """
+    root = query_egdata(epoch_index)
+    if root is None:
+        return None
+    total_weight = int(root.get("total_weight") or 0)
+    if not total_weight:
+        return None
+
+    cw: dict[str, int] = {}
+    for model_id in MODELS:
+        sub = query_egdata(epoch_index, model_id)
+        if sub is None:
+            continue
+        weights = sub.get("validation_weights") or []
+        cw[model_id] = sum(int(w.get("confirmation_weight", 0)) for w in weights)
+
+    cw_total = sum(cw.values())
+    if not cw_total:
+        return None
+
+    result: dict[str, int] = {"_total": total_weight}
+    for model_id in MODELS:
+        result[model_id] = round(cw.get(model_id, 0) / cw_total * total_weight)
+    return result
 
 
-def fmt_pct(w: int, total: int) -> str:
-    if not total:
+def fmt_w(w: int | None) -> str:
+    if w is None:
+        return "-"
+    return f"{w:,}"
+
+
+def fmt_pct(w: int | None, total: int) -> str:
+    if w is None or not total:
         return "-"
     return f"{w / total * 100:.1f}%"
 
@@ -95,73 +121,42 @@ def main() -> None:
     first_epoch = current_epoch - epochs_back + 1
     print(f"Querying epochs {first_epoch}–{current_epoch} ({epochs_back} epochs)\n")
 
-    # Collect data
     rows = []
     for epoch in range(first_epoch, current_epoch + 1):
-        start_poc = epoch_start_height(epoch)
-        end_poc = epoch_start_height(epoch + 1)
-
         print(f"  epoch {epoch}...", end=" ", flush=True)
-        start_w = get_model_weights(start_poc, start_poc + 100)
-
-        if epoch < current_epoch:
-            end_w = get_model_weights(end_poc, end_poc + 100)
-        else:
-            end_w = None  # epoch in progress
-
-        rows.append((epoch, start_w, end_w))
-        print("ok" if start_w else "no data")
-
-    # --- Print table ---
-    # Columns: Epoch | Minimax start | Minimax start% | Kimi start | Kimi start% | Minimax end | ... | Kimi end | ...
-    # Header groups: START OF EPOCH / END OF EPOCH
+        data = get_epoch_data(epoch)
+        rows.append((epoch, data))
+        print("ok" if data else "no data")
 
     print()
 
-    # Column widths
-    cE = 6    # epoch
-    cW = 11   # weight
-    cP = 7    # pct
+    cE = 6
+    cW = 11
+    cP = 7
+    cT = 12  # total weight column
 
-    # Build header
-    def col_headers():
-        parts = [f"{'Epoch':>{cE}}"]
-        for phase in ("START", "END"):
-            for name in [SHORT[m] for m in MODELS]:
-                parts.append(f"{name:>{cW}}")
-                parts.append(f"{'%':>{cP}}")
-        return "  ".join(parts)
-
-    def phase_banner():
-        # Phase labels above model columns
-        blank = " " * cE
-        start_span = (cW + 2 + cP + 2) * len(MODELS) - 2   # width of all START columns
-        end_span = start_span
-        return f"{blank}  {'── START ──':^{start_span}}  {'── END ──':^{end_span}}"
-
-    header = col_headers()
+    header = "  ".join([
+        f"{'Epoch':>{cE}}",
+        f"{'Total':>{cT}}",
+        *[part for m in MODELS for part in (f"{SHORT[m]:>{cW}}", f"{'%':>{cP}}")],
+    ])
     sep = "─" * len(header)
 
-    print(phase_banner())
     print(header)
     print(sep)
 
-    for epoch, start_w, end_w in rows:
-        parts = [f"{epoch:>{cE}}"]
-
-        for weights in (start_w, end_w):
-            if weights is None:
-                # epoch in progress
-                for _ in MODELS:
-                    parts.append(f"{'~':>{cW}}")
-                    parts.append(f"{'~':>{cP}}")
-            else:
-                total = sum(weights.values())
-                for m in MODELS:
-                    w = weights.get(m, 0)
-                    parts.append(f"{fmt_w(w):>{cW}}")
-                    parts.append(f"{fmt_pct(w, total):>{cP}}")
-
+    for epoch, data in rows:
+        if data is None:
+            parts = [f"{epoch:>{cE}}", f"{'-':>{cT}}"]
+            for _ in MODELS:
+                parts += [f"{'-':>{cW}}", f"{'-':>{cP}}"]
+        else:
+            total = data["_total"]
+            parts = [f"{epoch:>{cE}}", f"{fmt_w(total):>{cT}}"]
+            for m in MODELS:
+                w = data.get(m)
+                parts.append(f"{fmt_w(w):>{cW}}")
+                parts.append(f"{fmt_pct(w, total):>{cP}}")
         print("  ".join(parts))
 
     print(sep)

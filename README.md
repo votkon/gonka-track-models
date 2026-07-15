@@ -37,4 +37,7 @@ python model_weights.py [epochs_back]
 python model_weights.py 10
 ```
 
-Prints a table showing each model's weight and share of total at the start and end of each epoch.
+Prints a table showing total network weight and each model's share per epoch.
+
+- **Total** — root `epoch_group_data.total_weight`, matching the value shown on the tracker.
+- **Per-model split** — each model's share of the total, derived from `confirmation_weight` ratios in the model subgroups (`confirmation_weight` = raw PoC weight scaled by the per-model `WeightScaleFactor`).
